@@ -10,23 +10,31 @@ import static net.snowflake.client.core.SessionUtil.*;
 
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
-import java.io.ByteArrayInputStream;
-import java.io.IOException;
-import java.io.Serializable;
+import java.io.*;
+import java.net.URISyntaxException;
 import java.sql.ResultSet;
 import java.sql.SQLException;
 import java.util.*;
+import java.util.zip.GZIPInputStream;
 import net.snowflake.client.core.*;
 import net.snowflake.client.jdbc.telemetry.NoOpTelemetryClient;
 import net.snowflake.client.jdbc.telemetry.Telemetry;
 import net.snowflake.client.log.ArgSupplier;
 import net.snowflake.client.log.SFLogger;
 import net.snowflake.client.log.SFLoggerFactory;
+import net.snowflake.client.util.SecretDetector;
 import net.snowflake.common.core.SFBinaryFormat;
 import net.snowflake.common.core.SnowflakeDateTimeFormat;
+import net.snowflake.common.core.SqlState;
 import org.apache.arrow.memory.RootAllocator;
 import org.apache.arrow.vector.VectorSchemaRoot;
 import org.apache.arrow.vector.ipc.ArrowStreamReader;
+import org.apache.http.Header;
+import org.apache.http.HttpEntity;
+import org.apache.http.HttpResponse;
+import org.apache.http.client.methods.HttpGet;
+import org.apache.http.client.utils.URIBuilder;
+import org.apache.http.impl.client.CloseableHttpClient;
 
 /**
  * This object is an intermediate object between result JSON from GS and ResultSet. Originally, it
@@ -157,6 +165,7 @@ public class SnowflakeResultSetSerializableV1
   transient ChunkDownloader chunkDownloader = null;
   transient RootAllocator rootAllocator = null; // only used for ARROW result
   transient SFResultSetMetaData resultSetMetaData = null;
+  transient StreamFetcher streamFetcher = new DefaultStreamFetcher();
 
   /** Default constructor. */
   public SnowflakeResultSetSerializableV1() {}
@@ -227,6 +236,7 @@ public class SnowflakeResultSetSerializableV1
     this.chunkDownloader = toCopy.chunkDownloader;
     this.rootAllocator = toCopy.rootAllocator;
     this.resultSetMetaData = toCopy.resultSetMetaData;
+    this.streamFetcher = toCopy.streamFetcher;
   }
 
   public void setRootAllocator(RootAllocator rootAllocator) {
@@ -247,6 +257,14 @@ public class SnowflakeResultSetSerializableV1
 
   public void setChunkDownloader(ChunkDownloader chunkDownloader) {
     this.chunkDownloader = chunkDownloader;
+  }
+
+  public void setStreamFetcher(StreamFetcher streamFetcher) {
+    this.streamFetcher = streamFetcher;
+  }
+
+  public StreamFetcher getStreamFetcher() {
+    return streamFetcher;
   }
 
   public SFResultSetMetaData getSFResultSetMetaData() {
@@ -447,6 +465,25 @@ public class SnowflakeResultSetSerializableV1
   public static SnowflakeResultSetSerializableV1 create(
       JsonNode rootNode, SFBaseSession sfSession, SFBaseStatement sfStatement)
       throws SnowflakeSQLException {
+    return create(rootNode, sfSession, sfStatement, new DefaultStreamFetcher());
+  }
+
+  /**
+   * A factory function to create SnowflakeResultSetSerializable object from result JSON node, with
+   * an overrideable StreamFetcher.
+   *
+   * @param rootNode result JSON node received from GS
+   * @param sfSession the Snowflake session
+   * @param sfStatement the Snowflake statement
+   * @return processed ResultSetSerializable object
+   * @throws SnowflakeSQLException if failed to parse the result JSON node
+   */
+  public static SnowflakeResultSetSerializableV1 create(
+      JsonNode rootNode,
+      SFBaseSession sfSession,
+      SFBaseStatement sfStatement,
+      StreamFetcher streamFetcher)
+      throws SnowflakeSQLException {
     SnowflakeResultSetSerializableV1 resultSetSerializable = new SnowflakeResultSetSerializableV1();
     logger.debug("Entering create()");
 
@@ -500,6 +537,8 @@ public class SnowflakeResultSetSerializableV1
 
       logger.debug("Get column metadata: {}", (ArgSupplier) () -> columnMetadata.toString());
     }
+
+    resultSetSerializable.streamFetcher = streamFetcher;
 
     // process the content of first chunk.
     if (resultSetSerializable.queryResultFormat == QueryResultFormat.ARROW) {
@@ -799,6 +838,8 @@ public class SnowflakeResultSetSerializableV1
 
     // Setup memory limitation from parameters and System Runtime.
     this.memoryLimit = initMemoryLimit(this.parameters);
+
+    this.streamFetcher = new DefaultStreamFetcher();
 
     // Create below transient fields on the fly.
     if (QueryResultFormat.ARROW.equals(this.queryResultFormat)) {
@@ -1114,5 +1155,245 @@ public class SnowflakeResultSetSerializableV1
     }
 
     return builder.toString();
+  }
+
+  /**
+   * Simple struct to contain download context for a chunk. This is useful to organize the
+   * collection of properties that may be used for containing download information, and allows for
+   * the getInputStream() method to be overriden.
+   */
+  public static class ChunkDownloadContext {
+    private final SnowflakeChunkDownloader chunkDownloader;
+
+    public SnowflakeChunkDownloader getChunkDownloader() {
+      return chunkDownloader;
+    }
+
+    public SnowflakeResultChunk getResultChunk() {
+      return resultChunk;
+    }
+
+    public String getQrmk() {
+      return qrmk;
+    }
+
+    public int getChunkIndex() {
+      return chunkIndex;
+    }
+
+    public Map<String, String> getChunkHeadersMap() {
+      return chunkHeadersMap;
+    }
+
+    public int getNetworkTimeoutInMilli() {
+      return networkTimeoutInMilli;
+    }
+
+    public SFBaseSession getSession() {
+      return session;
+    }
+
+    private final SnowflakeResultChunk resultChunk;
+    private final String qrmk;
+    private final int chunkIndex;
+    private final Map<String, String> chunkHeadersMap;
+    private final int networkTimeoutInMilli;
+    private final SFBaseSession session;
+
+    public ChunkDownloadContext(
+        SnowflakeChunkDownloader chunkDownloader,
+        SnowflakeResultChunk resultChunk,
+        String qrmk,
+        int chunkIndex,
+        Map<String, String> chunkHeadersMap,
+        int networkTimeoutInMilli,
+        SFBaseSession session) {
+      this.chunkDownloader = chunkDownloader;
+      this.resultChunk = resultChunk;
+      this.qrmk = qrmk;
+      this.chunkIndex = chunkIndex;
+      this.chunkHeadersMap = chunkHeadersMap;
+      this.networkTimeoutInMilli = networkTimeoutInMilli;
+      this.session = session;
+    }
+  }
+
+  // Defines how the underlying data stream is to be fetched; i.e.
+  // allows large resultset data to come from a different source
+  public abstract static class StreamFetcher {
+    private ChunkDownloadContext currentContext;
+
+    void setChunkDownloadContext(ChunkDownloadContext context) {
+      this.currentContext = context;
+    }
+
+    protected ChunkDownloadContext getCurrentContext() throws Exception {
+      if (currentContext == null) {
+        throw new Exception("asdf");
+      }
+
+      return currentContext;
+    }
+
+    abstract InputStream getInputStream() throws Exception;
+  }
+
+  private static class DefaultStreamFetcher extends StreamFetcher {
+    // SSE-C algorithm header
+    private static final String SSE_C_ALGORITHM = "x-amz-server-side-encryption-customer-algorithm";
+
+    // SSE-C customer key header
+    private static final String SSE_C_KEY = "x-amz-server-side-encryption-customer-key";
+
+    // SSE-C algorithm value
+    private static final String SSE_C_AES = "AES256";
+
+    private static final int STREAM_BUFFER_SIZE = MB;
+
+    @Override
+    InputStream getInputStream() throws Exception {
+      HttpResponse response;
+      try {
+        response = getResultChunk(getCurrentContext().getResultChunk().getUrl());
+      } catch (URISyntaxException | IOException ex) {
+        throw new SnowflakeSQLLoggedException(
+            getCurrentContext().getSession(),
+            ErrorCode.NETWORK_ERROR.getMessageCode(),
+            SqlState.IO_ERROR,
+            "Error encountered when request a result chunk URL: "
+                + getCurrentContext().getResultChunk().getUrl()
+                + " "
+                + ex.getLocalizedMessage());
+      }
+
+      /*
+       * return error if we don't get a response or the response code
+       * means failure.
+       */
+      if (response == null || response.getStatusLine().getStatusCode() != 200) {
+        logger.error(
+            "Error fetching chunk from: {}", getCurrentContext().getResultChunk().getScrubbedUrl());
+
+        SnowflakeUtil.logResponseDetails(response, logger);
+
+        throw new SnowflakeSQLException(
+            SqlState.IO_ERROR,
+            ErrorCode.NETWORK_ERROR.getMessageCode(),
+            "Error encountered when downloading a result chunk: HTTP "
+                + "status="
+                + ((response != null)
+                    ? response.getStatusLine().getStatusCode()
+                    : "null response"));
+      }
+
+      InputStream inputStream;
+      final HttpEntity entity = response.getEntity();
+      try {
+        // read the chunk data
+        inputStream = detectContentEncodingAndGetInputStream(response, entity.getContent());
+      } catch (Exception ex) {
+        logger.error("Failed to decompress data: {}", response);
+
+        throw new SnowflakeSQLLoggedException(
+            getCurrentContext().getSession(),
+            ErrorCode.INTERNAL_ERROR.getMessageCode(),
+            SqlState.INTERNAL_ERROR,
+            "Failed to decompress data: " + response.toString());
+      }
+
+      // trace the response if requested
+      logger.debug("Json response: {}", response);
+
+      return inputStream;
+    }
+
+    private HttpResponse getResultChunk(String chunkUrl) throws Exception {
+      URIBuilder uriBuilder = new URIBuilder(chunkUrl);
+
+      HttpGet httpRequest = new HttpGet(uriBuilder.build());
+
+      if (getCurrentContext().getChunkHeadersMap() != null
+          && getCurrentContext().getChunkHeadersMap().size() != 0) {
+        for (Map.Entry<String, String> entry :
+            getCurrentContext().getChunkHeadersMap().entrySet()) {
+          logger.debug("Adding header key={}, value={}", entry.getKey(), entry.getValue());
+          httpRequest.addHeader(entry.getKey(), entry.getValue());
+        }
+      }
+      // Add SSE-C headers
+      else if (getCurrentContext().getQrmk() != null) {
+        httpRequest.addHeader(SSE_C_ALGORITHM, SSE_C_AES);
+        httpRequest.addHeader(SSE_C_KEY, getCurrentContext().getQrmk());
+        logger.debug("Adding SSE-C headers");
+      }
+
+      logger.debug(
+          "Thread {} Fetching result #chunk{}: {}",
+          Thread.currentThread().getId(),
+          getCurrentContext().getChunkIndex(),
+          getCurrentContext().getResultChunk().getScrubbedUrl());
+
+      // TODO move this s3 request to HttpUtil class. In theory, upper layer
+      // TODO does not need to know about http client
+      CloseableHttpClient httpClient =
+          HttpUtil.getHttpClient(getCurrentContext().getChunkDownloader().getOCSPMode());
+
+      // fetch the result chunk
+      HttpResponse response =
+          RestRequest.execute(
+              httpClient,
+              httpRequest,
+              getCurrentContext().getNetworkTimeoutInMilli() / 1000, // retry timeout
+              0, // no socketime injection
+              null, // no canceling
+              false, // no cookie
+              false, // no retry
+              false, // no request_guid
+              true // retry on HTTP403 for AWS S3
+              );
+
+      logger.debug(
+          "Thread {} Call #chunk{} returned for URL: {}, response={}",
+          Thread.currentThread().getId(),
+          getCurrentContext().getChunkIndex(),
+          (ArgSupplier) () -> SecretDetector.maskSASToken(chunkUrl),
+          response);
+      return response;
+    }
+
+    private InputStream detectContentEncodingAndGetInputStream(
+        HttpResponse response, InputStream is) throws IOException, SnowflakeSQLException {
+      InputStream inputStream = is; // Determine the format of the response, if it is not
+      // either plain text or gzip, raise an error.
+      Header encoding = response.getFirstHeader("Content-Encoding");
+      if (encoding != null) {
+        if ("gzip".equalsIgnoreCase(encoding.getValue())) {
+          /* specify buffer size for GZIPInputStream */
+          inputStream = new GZIPInputStream(is, STREAM_BUFFER_SIZE);
+        } else {
+          throw new SnowflakeSQLException(
+              SqlState.INTERNAL_ERROR,
+              ErrorCode.INTERNAL_ERROR.getMessageCode(),
+              "Exception: unexpected compression got " + encoding.getValue());
+        }
+      } else {
+        inputStream = detectGzipAndGetStream(is);
+      }
+
+      return inputStream;
+    }
+
+    private InputStream detectGzipAndGetStream(InputStream is) throws IOException {
+      PushbackInputStream pb = new PushbackInputStream(is, 2);
+      byte[] signature = new byte[2];
+      int len = pb.read(signature);
+      pb.unread(signature, 0, len);
+      // https://tools.ietf.org/html/rfc1952
+      if (signature[0] == (byte) 0x1f && signature[1] == (byte) 0x8b) {
+        return new GZIPInputStream(pb);
+      } else {
+        return pb;
+      }
+    }
   }
 }

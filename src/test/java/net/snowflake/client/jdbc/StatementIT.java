@@ -47,6 +47,7 @@ public class StatementIT extends BaseJDBCTest {
     Connection conn = BaseJDBCTest.getConnection();
     Statement stmt = conn.createStatement();
     stmt.execute("alter session set jdbc_query_result_format = '" + queryResultFormat + "'");
+    // stmt.execute("alter session set result_first_chunk_max_size = 0");
     stmt.close();
     return conn;
   }
@@ -76,6 +77,22 @@ public class StatementIT extends BaseJDBCTest {
     statement.setFetchSize(1);
     ResultSet rs = statement.executeQuery("select * from JDBC_STATEMENT");
     assertEquals(1, getSizeOfResultSet(rs));
+
+    statement.close();
+    connection.close();
+  }
+
+  @Test
+  public void testBlah() throws SQLException {
+    Connection connection = getConnection();
+    Statement statement = connection.createStatement();
+    ResultSet rs = statement.executeQuery("select random() from table(generator(rowCount=> 4097))");
+
+    for (int i = 0; i < 4096; i++) {
+      rs.next();
+    }
+
+    long foo = rs.getLong(1);
 
     statement.close();
     connection.close();
